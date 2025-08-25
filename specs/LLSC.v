@@ -20,7 +20,9 @@ Module Type LLSC (Config : LLSC_Config).
   | VLWait (v : nat)
   | VLDone (ret : bool)
   | SCWait (x : val_t)
-  | SCDone (ret : bool).
+  | SCDone (ret : bool)
+  | WriteWait (x : val_t)
+  | WriteDone.
 
   Record LLSC_State := {
     llsc_curr_ver : nat;
@@ -119,6 +121,20 @@ Module Type LLSC (Config : LLSC_Config).
     llsc_cmd := NatMap_add nid (SCDone false) st.(llsc_cmd);
   |}.
 
+  Definition llsc_start_write (nid : nat) (x : val_t) (st : LLSC_State) := {|
+    llsc_curr_ver := st.(llsc_curr_ver);
+    llsc_curr_excl_ver := st.(llsc_curr_excl_ver);
+    llsc_val_hist := st.(llsc_val_hist);
+    llsc_cmd := NatMap_add nid (WriteWait x) st.(llsc_cmd);
+  |}.
+
+  Definition llsc_succ_write (nid : nat) (x : val_t) (st : LLSC_State) := {|
+    llsc_curr_ver := S st.(llsc_curr_ver);
+    llsc_curr_excl_ver := st.(llsc_curr_excl_ver);
+    llsc_val_hist := NatMap_add (S st.(llsc_curr_ver)) x st.(llsc_val_hist);
+    llsc_cmd := NatMap_add nid WriteDone st.(llsc_cmd);
+  |}.
+
   Inductive llsc_call_step : LLSC_State -> LLSC_State -> Prop :=
   | llsc_call_step_ll : forall nid st,
       nid < Config.n ->
@@ -135,7 +151,11 @@ Module Type LLSC (Config : LLSC_Config).
   | llsc_call_step_sc : forall nid x st,
       nid < Config.n ->
       llsc_get_cmd nid st = LLDone ->
-      llsc_call_step st (llsc_start_sc nid x st).
+      llsc_call_step st (llsc_start_sc nid x st)
+  | llsc_call_step_write : forall nid x st,
+      nid < Config.n ->
+      llsc_get_cmd nid st = Idle ->
+      llsc_call_step st (llsc_start_write nid x st).
 
   Inductive llsc_vl_step : LLSC_State -> LLSC_State -> Prop :=
   | llsc_ret_step_vl_succ : forall nid v st,
@@ -161,6 +181,12 @@ Module Type LLSC (Config : LLSC_Config).
       llsc_get_excl_ver nid st < st.(llsc_curr_ver) ->
       llsc_sc_step st (llsc_fail_sc nid st).
 
+  Inductive llsc_write_step : LLSC_State -> LLSC_State -> Prop :=
+  | llsc_ret_step_write_succ : forall nid x st,
+      nid < Config.n ->
+      llsc_get_cmd nid st = WriteWait x ->
+      llsc_write_step st (llsc_succ_write nid x st).
+
   Inductive llsc_ret_step : LLSC_State -> LLSC_State -> Prop :=
   | llsc_ret_step_ll : forall nid v v' st,
       nid < Config.n ->
@@ -174,9 +200,13 @@ Module Type LLSC (Config : LLSC_Config).
   | llsc_ret_step_sc : forall nid b st,
       nid < Config.n ->
       llsc_get_cmd nid st = SCDone b ->
+      llsc_ret_step st (llsc_cl nid st)
+  | llsc_ret_step_write : forall nid st,
+      nid < Config.n ->
+      llsc_get_cmd nid st = WriteDone ->
       llsc_ret_step st (llsc_cl nid st).
 
-  Definition llsc_step st st' := llsc_call_step st st' \/ llsc_vl_step st st' \/ llsc_sc_step st st' \/ llsc_ret_step st st'.
+  Definition llsc_step st st' := llsc_call_step st st' \/ llsc_vl_step st st' \/ llsc_sc_step st st' \/ llsc_write_step st st' \/ llsc_ret_step st st'.
 
   Definition llsc_sem : Semantics := {|
     s_state := LLSC_State;
@@ -187,15 +217,16 @@ Module Type LLSC (Config : LLSC_Config).
   #[local] Notation llsc_valid st := (valid_state llsc_sem st).
   #[local] Notation llsc_reachable st st' := (reachable llsc_sem st st').
 
-  Ltac llsc_unfold := unfold llsc_start_ll, llsc_ret_ll, llsc_cl, llsc_start_vl, llsc_succ_vl, llsc_fail_vl, llsc_ret_vl, llsc_start_sc, llsc_succ_sc, llsc_fail_sc, llsc_get_excl_ver, llsc_get_cmd.
+  Ltac llsc_unfold := unfold llsc_start_ll, llsc_ret_ll, llsc_cl, llsc_start_vl, llsc_succ_vl, llsc_fail_vl, llsc_ret_vl, llsc_start_sc, llsc_succ_sc, llsc_fail_sc, llsc_start_write, llsc_succ_write, llsc_get_excl_ver, llsc_get_cmd.
   Ltac llsc_reduce := cbn [llsc_curr_ver llsc_curr_excl_ver llsc_val_hist llsc_cmd].
 
   Ltac step_case Hstep :=
-    destruct Hstep as [Hstep | [Hstep | [Hstep | Hstep]]];
-    [ destruct Hstep as [nid st Hpre1 Hpre2 | nid st Hpre1 Hpre2 | nid st Hpre1 Hpre2 | nid x st Hpre1 Hpre2] |
+    destruct Hstep as [Hstep | [Hstep | [Hstep | [Hstep | Hstep]]]];
+    [ destruct Hstep as [nid st Hpre1 Hpre2 | nid st Hpre1 Hpre2 | nid st Hpre1 Hpre2 | nid x st Hpre1 Hpre2 | nid x st Hpre1 Hpre2] |
       destruct Hstep as [nid v st Hpre1 Hpre2 Hpre3 | nid v st Hpre1 Hpre2 Hpre3] |
       destruct Hstep as [nid x st Hpre1 Hpre2 Hpre3 | nid x st Hpre1 Hpre2 Hpre3] |
-      destruct Hstep as [nid v v' st Hpre1 Hpre2 Hpre3 | nid b st Hpre1 Hpre2 | nid b st Hpre1 Hpre2]
+      destruct Hstep as [nid x st Hpre1 Hpre2] |
+      destruct Hstep as [nid v v' st Hpre1 Hpre2 Hpre3 | nid b st Hpre1 Hpre2 | nid b st Hpre1 Hpre2 | nid st Hpre1 Hpre2]
     ].
 
   Lemma llsc_excl_ver_le : forall nid st,
@@ -223,6 +254,7 @@ Module Type LLSC (Config : LLSC_Config).
       all: llsc_unfold; llsc_reduce; destruct (Nat.eq_dec NID nid); [subst NID; rewrite NatMap_gse by auto; try discriminate | rewrite NatMap_gso by auto; try apply IH].
       + intros Heq; injection Heq; intros; subst V; auto.
       + intros Heq; specialize (IH Heq); lia.
+      + intros Heq; specialize (IH Heq); lia.
   Qed.
 
   Lemma llsc_vl_wait_phase_prop1 : forall nid v st,
@@ -236,6 +268,7 @@ Module Type LLSC (Config : LLSC_Config).
     - step_case Hstep.
       all: llsc_unfold; llsc_reduce; destruct (Nat.eq_dec NID nid); [subst NID; rewrite NatMap_gse by auto; try discriminate | rewrite NatMap_gso by auto; try apply IH].
       + intros Heq; injection Heq; intros; subst V; auto.
+      + intros Heq; specialize (IH Heq); lia.
       + intros Heq; specialize (IH Heq); lia.
   Qed.
 

@@ -31,7 +31,9 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
   | SCLLWait (chk_v : nat) (x : val_t)
   | SCLLDone (chk_v : nat) (ll_v : nat) (x : val_t)
   | SCSCWait (chk_v : nat) (ll_v : nat) (x : val_t) (t : tag_t)
-  | SCReadTag.
+  | SCReadTag
+  | WriteStart (x : val_t)
+  | WriteWait (x : val_t) (t : tag_t).
 
   Record Adrs_State := {
     (* The FSC object state *)
@@ -222,6 +224,27 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
     adrs_lock_view := NatMap_add nid (NatMap_add nid' t (adrs_get_local_view nid st)) st.(adrs_lock_view);
   |}.
 
+  Definition adrs_start_write (nid : nat) (x : val_t) (st : Adrs_State) := {|
+    adrs_fsc := st.(adrs_fsc);
+    adrs_phase := NatMap_add nid (WriteStart x) st.(adrs_phase);
+    adrs_lock_array := st.(adrs_lock_array);
+    adrs_lock_view := st.(adrs_lock_view);
+  |}.
+
+  Definition adrs_write_choose_tag (nid : nat) (x : val_t) (t : tag_t) (st : Adrs_State) := {|
+    adrs_fsc := fsc_start_write nid x t st.(adrs_fsc);
+    adrs_phase := NatMap_add nid (WriteWait x t) st.(adrs_phase);
+    adrs_lock_array := st.(adrs_lock_array);
+    adrs_lock_view := st.(adrs_lock_view);
+  |}.
+
+  Definition adrs_write_succ (nid : nat) (x : val_t) (t : tag_t) (st : Adrs_State) := {|
+    adrs_fsc := fsc_ret_write nid x t st.(adrs_fsc);
+    adrs_phase := NatMap_add nid SCReadTag st.(adrs_phase);
+    adrs_lock_array := st.(adrs_lock_array);
+    adrs_lock_view := st.(adrs_lock_view);
+  |}.
+
   Parameter read_tag_schedule : nat -> nat.
   Parameter read_tag_schedule_next : nat -> nat -> nat.
   Parameter read_tag_schedule_next_prop : forall nid n, nid < Config.n -> n < read_tag_schedule_next nid n <= n + Config.n /\ read_tag_schedule (read_tag_schedule_next nid n) = nid.
@@ -242,7 +265,11 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
   | adrs_call_step_cl : forall nid v v' st,
       nid < Config.n ->
       adrs_get_phase nid st = LLDone v v' ->
-      adrs_call_step st (adrs_cl nid st).
+      adrs_call_step st (adrs_cl nid st)
+  | adrs_call_step_write : forall nid x st,
+      nid < Config.n ->
+      adrs_get_phase nid st = Idle ->
+      adrs_call_step st (adrs_start_write nid x st).
 
   Inductive adrs_internal_step : Adrs_State -> Adrs_State -> Prop :=
   | adrs_int_step_read1 : forall nid st,
@@ -316,7 +343,28 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
       nid < Config.n ->
       adrs_get_phase nid st = SCSCWait v v' x t ->
       fsc_get_cmd nid st.(adrs_fsc) = FSC.SCDone true ->
-      adrs_internal_step st (adrs_ret_fsc_succ nid st).
+      adrs_internal_step st (adrs_ret_fsc_succ nid st)
+  | adrs_int_step_write_choose_tag : forall nid x lv t st,
+      nid < Config.n ->
+      adrs_get_phase nid st = WriteStart x ->
+      (* See adrs_int_step_start_fsc above *)
+      fsc_get_succ_count nid st.(adrs_fsc) = lv ->
+      (forall v'' lv'' entry'',
+          NatMap_find v'' st.(adrs_fsc).(fsc_val_hist) = Some entry'' ->
+          snd (snd entry'') = nid ->
+          NatMap_find v'' st.(adrs_fsc).(fsc_local_ver) = Some lv'' ->
+          lv - Config.n <= lv'' ->
+          fst (snd entry'') <> t
+      ) ->
+      (forall nid',
+          nid' < Config.n ->
+          adrs_get_local_view_tag nid nid' st <> t
+      ) ->
+      adrs_internal_step st (adrs_write_choose_tag nid x t st)
+  | adrs_int_step_write_succ : forall nid x t st,
+      nid < Config.n ->
+      adrs_get_phase nid st = WriteWait x t ->
+      adrs_internal_step st (adrs_write_succ nid x t st).
 
   Inductive adrs_ret_step : Adrs_State -> Adrs_State -> Prop :=
   | adrs_ret_step_vl_fail_early : forall nid v v' entry entry' st,
@@ -371,7 +419,7 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
     match type of Hstep with adrs_step ?st ?st' =>
     unfold adrs_step in Hstep;
     destruct Hstep as [Hstep | [Hstep | Hstep]];
-    [ destruct Hstep as [nid st Hpre1 Hpre2 | nid v v' st Hpre1 Hpre2 | nid v v' x st Hpre1 Hpre2 | nid v v' st Hpre1 Hpre2] |
+    [ destruct Hstep as [nid st Hpre1 Hpre2 | nid v v' st Hpre1 Hpre2 | nid v v' x st Hpre1 Hpre2 | nid v v' st Hpre1 Hpre2 | nid x st Hpre1 Hpre2] |
       destruct Hstep as
       [ nid st Hpre1 Hpre2 |
         nid v entry t st Hpre1 Hpre2 Hpre3 Hpre4 |
@@ -383,9 +431,11 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         nid v v' x entry entry' lv t st Hpre1 Hpre2 Hpre3 Hpre4 Hpre5 Hpre6 Hpre7 Hpre8 |
         st st_fst Hpre |
         nid v v' x t st Hpre1 Hpre2 Hpre3 |
-        nid v v' x t st Hpre1 Hpre2 Hpre3
+        nid v v' x t st Hpre1 Hpre2 Hpre3 |
+        nid x lv t st Hpre1 Hpre2 Hpre3 Hpre4 Hpre5 |
+        nid x t st Hpre1 Hpre2
       ];
-      [ | | | | | | | | remember st.(adrs_fsc) as fsc_st; destruct Hpre as [nid x t fsc_st Hpre1 Hpre2 Hpre3 | nid x t fsc_st Hpre1 Hpre2] | | ] |
+      [ | | | | | | | | remember st.(adrs_fsc) as fsc_st; destruct Hpre as [nid x t fsc_st Hpre1 Hpre2 Hpre3 | nid x t fsc_st Hpre1 Hpre2] | | | | ] |
       destruct Hstep as
       [ nid v v' entry entry' st Hpre1 Hpre2 Hpre3 Hpre4 Hpre5 |
         nid v v' v'' entry entry' st Hpre1 Hpre2 Hpre3 Hpre4 Hpre5 |
@@ -396,7 +446,7 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
     ]
     end.
 
-  Ltac adrs_unfold := unfold adrs_start_ll, adrs_read1_done, adrs_write_tag_done, adrs_read2_done, adrs_cl, adrs_start_vl, adrs_vl_fail_early, adrs_vl_read, adrs_vl_read_done, adrs_vl_done, adrs_start_sc, adrs_start_fll, adrs_ret_fll, adrs_fsc_cl, adrs_start_fsc, adrs_fsc_step, adrs_ret_fsc_fail, adrs_ret_fsc_succ, adrs_read_tag_done, adrs_get_phase, adrs_get_locked_tag, adrs_get_locked_tag_local_time, adrs_get_local_view_tag, adrs_get_local_view.
+  Ltac adrs_unfold := unfold adrs_start_ll, adrs_read1_done, adrs_write_tag_done, adrs_read2_done, adrs_cl, adrs_start_vl, adrs_vl_fail_early, adrs_vl_read, adrs_vl_read_done, adrs_vl_done, adrs_start_sc, adrs_start_fll, adrs_ret_fll, adrs_fsc_cl, adrs_start_fsc, adrs_fsc_step, adrs_ret_fsc_fail, adrs_ret_fsc_succ, adrs_read_tag_done, adrs_start_write, adrs_write_choose_tag, adrs_write_succ, adrs_get_phase, adrs_get_locked_tag, adrs_get_locked_tag_local_time, adrs_get_local_view_tag, adrs_get_local_view.
   Ltac adrs_reduce := cbn [adrs_fsc adrs_phase adrs_lock_array adrs_lock_view].
 
   Definition adrs_phase_prop_def nid st :=
@@ -418,6 +468,8 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         fsc_get_cmd nid st.(adrs_fsc) = FSC.SCWait x t /\
         fsc_get_excl_ver nid st.(adrs_fsc) = v'
     | SCReadTag => fsc_get_cmd nid st.(adrs_fsc) = FSC.Idle
+    | WriteStart x => fsc_get_cmd nid st.(adrs_fsc) = FSC.Idle
+    | WriteWait x t => fsc_get_cmd nid st.(adrs_fsc) = FSC.WriteWait x t
     end.
 
   Lemma adrs_phase_prop : forall nid st,
@@ -507,6 +559,22 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
           fsc_unfold; fsc_reduce; rewrite NatMap_gso by auto.
           apply IH.
 
+      + (* adrs_write_choose_tag *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto.
+          fsc_unfold; fsc_reduce; rewrite NatMap_gse by auto; auto.
+        * adrs_unfold; adrs_reduce; rewrite NatMap_gso by auto.
+          fsc_unfold; fsc_reduce; rewrite NatMap_gso by auto.
+          apply IH.
+
+      + (* adrs_write_succ *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto.
+          fsc_unfold; fsc_reduce; rewrite NatMap_gse by auto; auto.
+        * adrs_unfold; adrs_reduce; rewrite NatMap_gso by auto.
+          fsc_unfold; fsc_reduce; rewrite NatMap_gso by auto.
+          apply IH.
+
       + (* fsc_cl *)
         destruct (Nat.eq_dec nid nid'').
         * subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto.
@@ -525,7 +593,7 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
     step_case Hstep.
     all: adrs_unfold; adrs_reduce; try apply reachable_self.
     all: eapply reachable_step.
-    1,3,5,7,9,13,15: apply reachable_self.
+    1,3,5,7,9,13,15,17,19: apply reachable_self.
     - cbn; left; constructor; auto.
       pose proof (adrs_phase_prop nid _ Hval) as Hphase.
       unfold adrs_phase_prop_def in Hphase; rewrite Hpre2 in Hphase; apply Hphase.
@@ -546,6 +614,12 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
       fsc_unfold; fsc_reduce; rewrite NatMap_gse; auto.
     - cbn; right; right; eapply fsc_ret_step_sc; auto.
       apply Hpre3.
+    - cbn; left; constructor; auto.
+      pose proof (adrs_phase_prop nid _ Hval) as Hphase.
+      unfold adrs_phase_prop_def in Hphase; rewrite Hpre2 in Hphase; apply Hphase.
+    - cbn; right; right; constructor; auto.
+      pose proof (adrs_phase_prop nid _ Hval) as Hphase.
+      unfold adrs_phase_prop_def in Hphase; rewrite Hpre2 in Hphase; apply Hphase.
     - cbn; left; constructor; auto.
       pose proof (adrs_phase_prop nid _ Hval) as Hphase.
       unfold adrs_phase_prop_def in Hphase; rewrite Hpre2 in Hphase; apply Hphase.
@@ -627,6 +701,23 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         * adrs_unfold; adrs_reduce.
           fsc_unfold; fsc_reduce; do 3 rewrite NatMap_gso by auto.
           apply IH.
+
+      + (* write_succ *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce.
+          fsc_unfold; fsc_reduce; rewrite NatMap_gse by auto.
+          discriminate.
+        * adrs_unfold; adrs_reduce.
+          fsc_unfold; fsc_reduce; do 3 rewrite NatMap_gso by auto.
+          intros Hphase1 Hphase2 Hlv'.
+          specialize (IH V V' x' t' lv' Hphase1 Hphase2 Hlv').
+          intros v'' lv'' entry'' Hv''1 Hv''2 Hv''3.
+          destruct (Nat.eq_dec v'' (S (fsc_curr_ver (adrs_fsc st)))).
+          1: subst v''; rewrite NatMap_gse in Hv''1 by auto; injection Hv''1; intros Heq; subst entry''; cbn in Hv''2; contradiction.
+          rewrite NatMap_gso in Hv''1 by auto.
+          rewrite NatMap_gso in Hv''3 by auto.
+          specialize (IH _ _ _ Hv''1 Hv''2 Hv''3).
+          apply IH.
   Qed.
 
   Lemma adrs_tag_selection2 : forall nid v v' x t st,
@@ -661,6 +752,123 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         destruct (Nat.eq_dec nid nid'').
         * subst nid''; adrs_unfold; adrs_reduce; apply IH.
         * adrs_unfold; adrs_reduce; apply IH.
+
+      + (* read_tag_done *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto; discriminate.
+        * adrs_unfold; adrs_reduce; do 2 rewrite NatMap_gso by auto; apply IH.
+  Qed.
+
+  Lemma adrs_tag_selection3 : forall nid x t lv st,
+    adrs_valid st ->
+    adrs_get_phase nid st = WriteWait x t ->
+    fsc_get_succ_count nid st.(adrs_fsc) = lv ->
+    forall v'' lv'' entry'',
+      NatMap_find v'' st.(adrs_fsc).(fsc_val_hist) = Some entry'' ->
+      snd (snd entry'') = nid ->
+      NatMap_find v'' st.(adrs_fsc).(fsc_local_ver) = Some lv'' ->
+      lv - Config.n <= lv'' ->
+      fst (snd entry'') <> t.
+  Proof.
+    intros nid'' x t lv st Hval.
+    revert x t lv.
+    induction Hval as [| st st' Hval IH Hstep].
+    - cbn; discriminate.
+    - cbn in Hstep; step_case Hstep.
+      all: intros x' t' lv'.
+      all: try (destruct (Nat.eq_dec nid nid''); [subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto; discriminate | adrs_unfold; adrs_reduce; rewrite NatMap_gso by auto; try apply IH; fsc_unfold; fsc_reduce; rewrite NatMap_gso by auto; apply IH]).
+
+      + (* fsc_succ_sc *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid'' fsc_st.
+          adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce.
+          intros Hphase.
+          pose proof (adrs_phase_prop nid _ Hval) as Hphase'.
+          unfold adrs_phase_prop_def in Hphase'.
+          fold (adrs_get_phase nid st) in Hphase.
+          rewrite Hphase in Hphase'.
+          rewrite Hphase' in Hpre2; discriminate.
+        * adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; rewrite NatMap_gso by auto.
+          intros Hphase Hlv.
+          specialize (IH _ _ _ Hphase Hlv).
+          intros v'' lv'' entry'' Hv'' Hentry'' Hlv'' Hle.
+          destruct (Nat.eq_dec v'' (S (fsc_curr_ver fsc_st))).
+          -- subst v''; rewrite NatMap_gse in Hv'' by auto.
+             injection Hv''; intros; subst.
+             cbn in n; contradiction.
+          -- rewrite NatMap_gso in Hv'' by auto.
+             rewrite NatMap_gso in Hlv'' by auto.
+             eapply IH.
+             1: apply Hv''.
+             2: apply Hlv''.
+             all: auto.
+
+      + (* fsc_fail_sc *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; apply IH.
+        * adrs_unfold; adrs_reduce; apply IH.
+
+      + (* write_choose_tag *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto.
+          intros Hphase; injection Hphase; intros ? ?; subst x' t'; clear Hphase.
+          fsc_unfold; fsc_reduce.
+          intros ?; subst lv lv'.
+          apply Hpre4.
+        * adrs_unfold; adrs_reduce; rewrite NatMap_gso by auto.
+          fsc_unfold; fsc_reduce.
+          apply IH.
+
+      + (* write_succ *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto; discriminate.
+        * adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; do 2 rewrite NatMap_gso by auto.
+          intros Hnid'' Hlv'.
+          specialize (IH _ _ _ Hnid'' Hlv').
+          intros v'' lv'' entry'' Hv'' Hentry'' Hlv''.
+          destruct (Nat.eq_dec v'' (S (fsc_curr_ver (adrs_fsc st)))).
+          -- subst v''; rewrite NatMap_gse in Hv'' by auto.
+             injection Hv''; intros; subst.
+             cbn in n; contradiction.
+          -- rewrite NatMap_gso in Hv'' by auto.
+             rewrite NatMap_gso in Hlv'' by auto.
+             eapply IH.
+             1: apply Hv''.
+             all: auto.
+  Qed.
+
+  Lemma adrs_tag_selection4 : forall nid x t st,
+    adrs_valid st ->
+    adrs_get_phase nid st = WriteWait x t ->
+    forall nid',
+      nid' < Config.n ->
+      adrs_get_local_view_tag nid nid' st <> t.
+  Proof.
+  intros nid'' x t st Hval.
+    revert x t.
+    induction Hval as [| st st' Hval IH Hstep].
+    - cbn; discriminate.
+    - cbn in Hstep; step_case Hstep.
+      all: intros x' t'.
+      all: try (destruct (Nat.eq_dec nid nid''); [subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto; discriminate | adrs_unfold; adrs_reduce; rewrite NatMap_gso by auto; apply IH]).
+
+      + (* fsc_succ_sc *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; apply IH.
+        * adrs_unfold; adrs_reduce; apply IH.
+
+      + (* fsc_fail_sc *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; apply IH.
+        * adrs_unfold; adrs_reduce; apply IH.
+
+      + (* write_choose_tag *)
+        destruct (Nat.eq_dec nid nid'').
+        * subst nid''; adrs_unfold; adrs_reduce; rewrite NatMap_gse by auto.
+          intros Hphase; injection Hphase; intros ? ?; subst x' t'; clear Hphase.
+          apply Hpre5.
+        * adrs_unfold; adrs_reduce; rewrite NatMap_gso by auto.
+          apply IH.
 
       + (* read_tag_done *)
         destruct (Nat.eq_dec nid nid'').
@@ -761,6 +969,22 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         fsc_unfold; fsc_reduce; rewrite NatMap_gse by auto; fold (fsc_get_succ_count nid (adrs_fsc st)).
         destruct IH as [IH | [(IH1 & IH2) | [(IH1 & IH2) | IH]]];
         [ left; auto | right; right; left; split; auto | right; right; left; split; auto | auto].
+
+      + (* write_succ *)
+        intros r r' HNID' Hr Hr'.
+        specialize (IH _ _ HNID' Hr Hr').
+        destruct IH as [IH | [(IH1 & IH2) | [(IH1 & IH2) | IH]]];
+        [ idtac | exfalso | exfalso | auto].
+        * fsc_unfold; fsc_reduce; repeat rewrite NatMap_gse by auto.
+          fold (fsc_get_succ_count nid (adrs_fsc st)).
+          assert (Hr'2 : S (fsc_get_succ_count nid (adrs_fsc st)) < r' \/ S (fsc_get_succ_count nid (adrs_fsc st)) = r') by lia.
+          destruct Hr'2 as [Hr'2 | Hr'2]; [left; auto | right; right; left; split; auto].
+        * pose proof (adrs_phase_prop nid st Hval) as Hphase;
+          unfold adrs_phase_prop_def in Hphase;
+          rewrite Hpre2 in Hphase;
+          rewrite Hphase in IH2;
+          discriminate.
+        * rewrite Hpre2 in IH2; discriminate.
 
       + (* read_tag_done *)
         intros r r' HNID' Hr Hr'.
@@ -863,6 +1087,46 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
              cbn; auto.
           -- repeat rewrite NatMap_gso by auto.
              apply IH.
+
+      + fsc_unfold; fsc_reduce.
+        destruct (Nat.eq_dec V (S (fsc_curr_ver (adrs_fsc st)))).
+        * subst V; repeat rewrite (NatMap_gse _ _ (S (fsc_curr_ver (adrs_fsc st)))) by auto.
+          destruct (Nat.eq_dec V' (S (fsc_curr_ver (adrs_fsc st)))).
+          -- subst V'; repeat rewrite NatMap_gse by auto.
+             intros _ _ _ _ HLV HLV'.
+             injection HLV; injection HLV'; intros Heq1 Heq2; subst LV LV'.
+             contradiction.
+          -- clear IH.
+             repeat rewrite NatMap_gso by auto.
+             intros Hentry Hentry'.
+             injection Hentry; intros Heq; subst Entry; clear Hentry; cbn [snd].
+             intros Hnid1 Hnid2; subst NID.
+             fold (fsc_get_succ_count nid (adrs_fsc st)).
+             intros HLV HLV' _; injection HLV; intros Heq; subst LV; clear HLV.
+             (* Invoke adrs_tag_selection3 *)
+             pose proof (adrs_tag_selection3 nid _ _ _ _ Hval Hpre2 ltac:(reflexivity)) as Htag.
+             specialize (Htag _ _ _ Hentry' Hnid2 HLV').
+             intros HLV'1 HLV'2.
+             specialize (Htag ltac:(lia)).
+             cbn; auto.
+             
+        * repeat rewrite (NatMap_gso _ (S (fsc_curr_ver (adrs_fsc st))) V) by auto.
+          destruct (Nat.eq_dec V' (S (fsc_curr_ver (adrs_fsc st)))).
+          -- subst V'; repeat rewrite NatMap_gse by auto.
+             clear IH.
+             intros Hentry Hentry'.
+             injection Hentry'; intros Heq; subst Entry'; clear Hentry'; cbn [snd].
+             intros Hnid1 Hnid2; revert Hnid1; subst NID; intros Hnid1.
+             fold (fsc_get_succ_count nid (adrs_fsc st)).
+             intros HLV HLV' _; injection HLV'; intros Heq; subst LV'; clear HLV'.
+             (* Invoke adrs_tag_selection3 *)
+             pose proof (adrs_tag_selection3 nid _ _ _ _ Hval Hpre2 ltac:(reflexivity)) as Htag.
+             specialize (Htag _ _ _ Hentry Hnid1 HLV).
+             intros HLV1 HLV2.
+             specialize (Htag ltac:(lia)).
+             cbn; auto.
+          -- repeat rewrite NatMap_gso by auto.
+             apply IH.
   Qed.
 
   Lemma adrs_tag_no_reuse2 : forall nid nid' r r' v entry lv st,
@@ -928,6 +1192,32 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         (* Now invoke adrs_tag_selection2 *)
         pose proof (adrs_tag_selection2 _ _ _ _ _ _ Hval Ephase _ HNID).
         auto.
+
+      + (* write_succ *)
+        fsc_unfold; fsc_reduce.
+        destruct (Nat.eq_dec V (S (fsc_curr_ver (adrs_fsc st)))).
+        2: repeat rewrite NatMap_gso by auto; apply IH.
+        subst V; repeat rewrite NatMap_gse by auto.
+        (* nid FSC should be in WriteWait phase *)
+        pose proof (adrs_phase_prop nid _ Hval) as Hphase.
+        unfold adrs_phase_prop_def in Hphase.
+        rewrite Hpre2 in Hphase.
+        (* By adrs_read_tag_progress, the tag locked by NID' should be in nid's view *)
+        fold (adrs_get_locked_tag_local_time NID' NID st).
+        fold (adrs_get_locked_tag NID' st).
+        fold (fsc_get_succ_count nid (adrs_fsc st)).
+        intros Hr Hr' Hentry1 Hentry2.
+        injection Hentry1; intros Heq; subst Entry; clear Hentry1.
+        cbn in Hentry2; subst NID.
+        intros HLV1 HLV2.
+        injection HLV1; intros Heq; subst LV; clear HLV1.
+        pose proof (adrs_read_tag_progress nid NID' _ _ _ Hval HNID Hr Hr') as Htag.
+        rewrite Hpre2, Hphase in Htag.
+        destruct Htag as [? | [(_ & ?) | [(_ & ?) | Htag]]]; try discriminate; [lia|].
+        rewrite <- Htag; cbn [fst snd].
+        (* Now invoke adrs_tag_selection4 *)
+        pose proof (adrs_tag_selection4 _ _ _ _ Hval Hpre2 _ HNID).
+        auto.
   Qed.
 
   Lemma adrs_write_tag_phase_prop : forall nid v st,
@@ -941,6 +1231,7 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
     - cbn in Hstep; step_case Hstep.
       all: adrs_unfold; adrs_reduce; destruct (Nat.eq_dec NID nid); [subst NID; repeat rewrite NatMap_gse by auto | repeat rewrite NatMap_gso by auto]; try discriminate; try apply IH.
       + intros Heq; injection Heq; intros; subst V; clear Heq; auto.
+      + fsc_unfold; fsc_reduce; intros H; specialize (IH H); lia.
       + fsc_unfold; fsc_reduce; intros H; specialize (IH H); lia.
       + fsc_unfold; fsc_reduce; intros H; specialize (IH H); lia.
   Qed.
@@ -992,6 +1283,22 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
           fold (fsc_get_succ_count NID' fsc_st). lia.
         * rewrite NatMap_gso by auto.
           fold (fsc_get_succ_count NID' fsc_st); apply IH3.
+      + intros Hphase; specialize (IH Hphase).
+        fsc_unfold; fsc_reduce; split; [lia|].
+        repeat rewrite (NatMap_gso _ (S (fsc_curr_ver (adrs_fsc st))) V) by lia.
+        destruct IH as (IH1 & IH2).
+        intros Entry LV Hentry HLV.
+        specialize (IH2 _ _ Hentry HLV).
+        destruct IH2 as (IH2 & IH3).
+        split; auto.
+        split; [apply IH3|].
+        intros NID'; fold (adrs_get_locked_tag_local_time NID NID' st).
+        destruct IH3 as (_ & IH3); specialize (IH3 NID').
+        destruct (Nat.eq_dec NID' nid).
+        * subst nid; rewrite NatMap_gse by auto.
+          fold (fsc_get_succ_count NID' (adrs_fsc st)). lia.
+        * rewrite NatMap_gso by auto.
+          fold (fsc_get_succ_count NID' (adrs_fsc st)); apply IH3.
   Qed.
 
   Lemma adrs_ll_done_phase_prop : forall nid v v' st,
@@ -1023,6 +1330,8 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
                 repeat rewrite (NatMap_gso _ (S (fsc_curr_ver fsc_st)) V) by lia;
                 destruct IH as (IH1 & IH2);
                 intros Entry Entry' LV LV' Hentry Hentry' HLV HLV';
+                try rewrite NatMap_gso in Hentry by lia;
+                try rewrite NatMap_gso in HLV by lia;
                 rewrite NatMap_gso in Hentry' by lia;
                 rewrite NatMap_gso in HLV' by lia;
                 specialize (IH2 _ _ _ _ Hentry Hentry' HLV HLV');
@@ -1085,6 +1394,11 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         pose proof (adrs_ll_done_phase_prop _ _ _ _ Hval ltac:(right; right; left; apply Hphase)) as (HV & _).
         do 2 rewrite NatMap_gso by lia.
         apply IH.
+      + intros Hphase; specialize (IH Hphase).
+        fsc_unfold; fsc_reduce.
+        pose proof (adrs_ll_done_phase_prop _ _ _ _ Hval ltac:(right; right; left; apply Hphase)) as (HV & _).
+        do 2 rewrite NatMap_gso by lia.
+        apply IH.
   Qed.
 
   Lemma adrs_vl_done_phase_prop : forall nid v v' v'' st,
@@ -1114,6 +1428,11 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
       + intros Hphase; specialize (IH Hphase).
         fsc_unfold; fsc_reduce; split; [lia|].
         rewrite Heqfsc_st; rewrite Heqfsc_st in IH.
+        pose proof (adrs_ll_done_phase_prop _ _ _ _ Hval ltac:(right; right; right; eexists; apply Hphase)).
+        do 2 rewrite NatMap_gso by lia.
+        apply IH.
+      + intros Hphase; specialize (IH Hphase).
+        fsc_unfold; fsc_reduce; split; [lia|].
         pose proof (adrs_ll_done_phase_prop _ _ _ _ Hval ltac:(right; right; right; eexists; apply Hphase)).
         do 2 rewrite NatMap_gso by lia.
         apply IH.
@@ -1149,6 +1468,17 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         repeat rewrite (NatMap_gso _ (S (fsc_curr_ver fsc_st)) V) by lia.
         destruct IH as (IH1 & IH2).
         intros Entry Entry' LV LV' Hentry Hentry' HLV HLV'.
+        rewrite NatMap_gso in Hentry' by lia.
+        rewrite NatMap_gso in HLV' by lia.
+        specialize (IH2 _ _ _ _ Hentry Hentry' HLV HLV').
+        apply IH2.
+      + intros Hphase; specialize (IH Hphase).
+        fsc_unfold; fsc_reduce; split; [lia|].
+        repeat rewrite (NatMap_gso _ (S (fsc_curr_ver fsc_st)) V) by lia.
+        destruct IH as (IH1 & IH2).
+        intros Entry Entry' LV LV' Hentry Hentry' HLV HLV'.
+        rewrite NatMap_gso in Hentry by lia.
+        rewrite NatMap_gso in HLV by lia.
         rewrite NatMap_gso in Hentry' by lia.
         rewrite NatMap_gso in HLV' by lia.
         specialize (IH2 _ _ _ _ Hentry Hentry' HLV HLV').
@@ -1326,6 +1656,33 @@ Module Type Anderson (Config : LLSC_Config) (Import FSC : FSC Config).
         split.
         1: eexists; split; [reflexivity | lia].
         apply IH2.
+
+      + (* write_done, NID in SCLLWait *)
+        intros v0 x0 Hphase.
+        destruct IH as (IH & _).
+        specialize (IH _ _ Hphase).
+        destruct IH as ((v' & IH1 & IH2) & IH3).
+        split; [exists v'; split; auto; lia|].
+        do 2 rewrite NatMap_gso by lia.
+        apply IH3.
+
+      + (* write_done, NID in SCLLDone *)
+        intros v0 v'0 x0 Hphase.
+        destruct IH as (_ & IH & _).
+        specialize (IH _ _ _ Hphase).
+        destruct IH as (IH1 & IH2).
+        split; [lia|].
+        do 2 rewrite NatMap_gso by lia.
+        apply IH2.
+
+      + (* write_done, NID in SCSCWait *)
+        intros v0 v'0 x0 t0 Hphase.
+        destruct IH as (_ & _ & IH).
+        specialize (IH _ _ _ _ Hphase).
+        destruct IH as (IH1 & IH2 & IH3).
+        do 2 try split; [auto | lia | ].
+        do 2 rewrite NatMap_gso by lia.
+        apply IH3.
   Qed.
 
 End Anderson.

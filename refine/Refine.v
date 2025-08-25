@@ -108,7 +108,13 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       llsc_get_excl_ver nid llsc_st = v;
     R_adrs_read_tag : forall nid,
       adrs_get_phase nid adrs_st = SCReadTag ->
-      llsc_get_cmd nid llsc_st = LLSC.SCDone true;
+      llsc_get_cmd nid llsc_st = LLSC.SCDone true \/ llsc_get_cmd nid llsc_st = LLSC.WriteDone;
+    R_adrs_write_start : forall nid x,
+      adrs_get_phase nid adrs_st = WriteStart x ->
+      llsc_get_cmd nid llsc_st = LLSC.WriteWait x;
+    R_adrs_write_wait : forall nid x t,
+      adrs_get_phase nid adrs_st = WriteWait x t ->
+      llsc_get_cmd nid llsc_st = LLSC.WriteWait x;
     R_adrs_ver : adrs_st.(adrs_fsc).(fsc_curr_ver) = llsc_st.(llsc_curr_ver);
     R_adrs_val_hist : forall v entry,
       NatMap_find v adrs_st.(adrs_fsc).(fsc_val_hist) = Some entry ->
@@ -136,6 +142,8 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       intros NID V V' X T; destruct (Nat.eq_dec NID nid); [ subst NID; adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gse by auto; try discriminate | adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gso by auto; try apply HR ] |
       intros NID V V' X T; destruct (Nat.eq_dec NID nid); [ subst NID; adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gse by auto; try discriminate | adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gso by auto; try apply HR ] |
       intros NID; destruct (Nat.eq_dec NID nid); [ subst NID; adrs_unfold; adrs_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gse by auto; try discriminate | adrs_unfold; adrs_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gso by auto; try apply HR ] |
+      intros NID X; destruct (Nat.eq_dec NID nid); [ subst NID; adrs_unfold; adrs_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gse by auto; try discriminate | adrs_unfold; adrs_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gso by auto; try apply HR ] |
+      intros NID X T; destruct (Nat.eq_dec NID nid); [ subst NID; adrs_unfold; adrs_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gse by auto; try discriminate | adrs_unfold; adrs_reduce; llsc_unfold; llsc_reduce; repeat rewrite NatMap_gso by auto; try apply HR ] |
       adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; llsc_unfold; llsc_reduce; try apply HR |
       intros V Entry; adrs_unfold; adrs_reduce; fsc_unfold; fsc_reduce; llsc_unfold; llsc_reduce; try apply HR
     ].
@@ -260,6 +268,14 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
         * hammer nid HR.
           auto.
 
+    - (* start_write *)
+      exists (llsc_start_write nid x llsc_st); split.
+      + eapply reachable_step; [apply reachable_self|].
+        left; constructor; auto.
+        apply (R_adrs_idle _ _ HR); auto.
+      + hammer nid HR.
+        intros Heq; injection Heq; intros; subst; reflexivity.
+
     - (* read1_done *)
       exists llsc_st; split.
       + apply reachable_self.
@@ -290,7 +306,7 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       + (* equal tags *)
         exists (llsc_ret_ll nid llsc_st.(llsc_curr_ver) llsc_st); split.
         * eapply reachable_step; [apply reachable_self|].
-          right; right; right; econstructor.
+          right; right; right; right; econstructor.
           1: auto.
           1: apply Hphase2.
           rewrite (R_adrs_ver _ _ HR) in Hphase3; lia.
@@ -305,7 +321,7 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       + (* unequal tags *)
         exists (llsc_ret_ll nid v llsc_st); split.
         * eapply reachable_step; [apply reachable_self|].
-          right; right; right; econstructor.
+          right; right; right; right; econstructor.
           1: auto.
           1: apply Hphase2.
           rewrite (R_adrs_ver _ _ HR) in Hphase3; lia.
@@ -511,8 +527,47 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       exists llsc_st; split.
       + apply reachable_self.
       + hammer nid HR.
-        intros _.
+        intros _; left.
         apply (R_adrs_sc_scwait2 _ _ HR _ _ _ _ _ Hpre2 Hpre3).
+
+    - (* write_choose_tag *)
+      exists llsc_st; split.
+      + apply reachable_self.
+      + hammer nid HR.
+        intros Heq; injection Heq; intros; subst X T; clear  Heq.
+        apply (R_adrs_write_start _ _ HR _ _ Hpre2).
+
+    - (* write_succ *)
+      exists (llsc_succ_write nid x llsc_st); split.
+      + eapply reachable_step; [apply reachable_self|].
+        right; right; right; left; constructor; auto.
+        apply (R_adrs_write_wait _ _ HR _ _ _ Hpre2).
+      + hammer nid HR.
+        9: right; auto.
+        9: rewrite (R_adrs_ver _ _ HR); auto.
+        9: NatMap_cmp V (S (fsc_curr_ver (adrs_fsc adrs_st))).
+        9: rewrite <- (R_adrs_ver _ _ HR); rewrite NatMap_gse; [|symmetry; auto]; intros Heq; injection Heq; intros; subst; cbn; auto.
+        9: rewrite <- (R_adrs_ver _ _ HR); rewrite NatMap_gso by auto; apply HR.
+        all: fsc_unfold; fsc_reduce.
+        1,2,3,4,5,6:
+          intros HNID1 HNID2 HNID3;
+          pose proof (adrs_ll_done_phase_prop _ _ _ _ Hval_adrs ltac:((left; apply HNID1) || (right; left; apply HNID1) || (right; right; left; apply HNID1) || (right; right; right; eexists; apply HNID1))) as (HNID5 & _);
+          rewrite NatMap_gso in HNID2 by lia;
+          try rewrite NatMap_gso in HNID3 by lia.
+        5,6: pose proof (adrs_vl_done_phase_prop _ _ _ _ _ Hval_adrs HNID1); rewrite NatMap_gso in HNID3 by lia.
+        1: apply (R_adrs_ll_done1 _ _ HR NID V V' Entry Entry' HNID1 HNID2 HNID3).
+        1: apply (R_adrs_ll_done2 _ _ HR NID V V' Entry Entry' HNID1 HNID2 HNID3).
+        1: apply (R_adrs_vl_start1 _ _ HR NID V V' Entry Entry' HNID1 HNID2 HNID3).
+        1: apply (R_adrs_vl_start2 _ _ HR NID V V' Entry Entry' HNID1 HNID2 HNID3).
+        1: apply (R_adrs_vl_done1 _ _ HR NID V V' V'' Entry' Entry'' HNID1 HNID2 HNID3).
+        1: apply (R_adrs_vl_done2 _ _ HR NID V V' V'' Entry' Entry'' HNID1 HNID2 HNID3).
+
+        1,2: intros HNID1 HNID2 HNID3 HNID4;
+             pose proof (adrs_sc_start_phase_prop _ _ _ _ _ Hval_adrs HNID1) as (HNID5 & _);
+             rewrite NatMap_gso in HNID2 by lia;
+             rewrite NatMap_gso in HNID3 by lia.
+        1: apply (R_adrs_sc_start1 _ _ HR NID V V' X Entry Entry' HNID1 HNID2 HNID3 HNID4).
+        1: apply (R_adrs_sc_start2 _ _ HR NID V V' X Entry Entry' HNID1 HNID2 HNID3 HNID4).
 
     - (* vl_fail_early *)
       pose proof (adrs_ll_done_phase_prop nid _ _ _ Hval_adrs ltac:(right; left; apply Hpre2)) as (Hphase & _).
@@ -523,7 +578,7 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
 
       exists (llsc_ret_vl nid (llsc_fail_vl nid llsc_st)); split.
       + eapply reachable_step; [eapply reachable_step; [apply reachable_self|]|].
-        2: right; right; right; econstructor.
+        2: right; right; right; right; econstructor.
         2: auto.
         1: right; left; econstructor.
         1: auto.
@@ -540,7 +595,7 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       pose proof (R_adrs_vl_done2 _ _ HR _ _ _ _ _ _ Hpre2 Hpre3 Hpre4 Hpre5) as (HR1 & HR2).
       exists (llsc_ret_vl nid llsc_st); split.
       + eapply reachable_step; [apply reachable_self|].
-        right; right; right; econstructor.
+        right; right; right; right; econstructor.
         1: auto.
         1: apply HR2.
       + hammer nid HR.
@@ -553,7 +608,7 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       pose proof (R_adrs_vl_done1 _ _ HR _ _ _ _ _ _ Hpre2 Hpre3 Hpre4 Hpre5) as (HR1 & HR2).
       exists (llsc_ret_vl nid llsc_st); split.
       + eapply reachable_step; [apply reachable_self|].
-        right; right; right; econstructor.
+        right; right; right; right; econstructor.
         1: auto.
         1: apply HR2.
       + hammer nid HR.
@@ -574,7 +629,7 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
       exists (llsc_cl nid (llsc_fail_sc nid llsc_st)); split.
       + eapply reachable_step; [eapply reachable_step|].
         1: apply reachable_self.
-        2: right; right; right; econstructor.
+        2: right; right; right; right; econstructor.
         1: right; right; left; econstructor.
         all: auto.
         1: apply HR'1.
@@ -585,8 +640,11 @@ Module Type Adrs_Refine (Config : LLSC_Config) (Import LLSC : LLSC Config) (Impo
     - (* read_tag_done *)
       exists (llsc_cl nid llsc_st); split.
       + eapply reachable_step; [apply reachable_self|].
-        right; right; right; econstructor; auto.
-        apply (R_adrs_read_tag _ _ HR _ Hpre2).
+        pose proof (R_adrs_read_tag _ _ HR _ Hpre2) as Hphase.
+        right; right; right; right.
+        destruct Hphase as [Hphase | Hphase].
+        * apply (llsc_ret_step_sc nid true); auto.
+        * apply llsc_ret_step_write; auto.
       + hammer nid HR; auto.
   Qed.
 

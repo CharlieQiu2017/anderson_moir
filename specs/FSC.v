@@ -20,7 +20,8 @@ Module Type FSC (Config : LLSC_Config).
   | LLWait (v : nat)
   | LLDone
   | SCWait (x : val_t) (t : tag_t)
-  | SCDone (ret : bool).
+  | SCDone (ret : bool)
+  | WriteWait (x : val_t) (t : tag_t).
 
   Record FSC_State := {
     fsc_curr_ver : nat;
@@ -117,6 +118,24 @@ Module Type FSC (Config : LLSC_Config).
     fsc_local_ver := st.(fsc_local_ver);
   |}.
 
+  Definition fsc_start_write (nid : nat) (x : val_t) (t : tag_t) (st : FSC_State) := {|
+    fsc_curr_ver := st.(fsc_curr_ver);
+    fsc_curr_excl_ver := st.(fsc_curr_excl_ver);
+    fsc_val_hist := st.(fsc_val_hist);
+    fsc_cmd := NatMap_add nid (WriteWait x t) st.(fsc_cmd);
+    fsc_succ_count := st.(fsc_succ_count);
+    fsc_local_ver := st.(fsc_local_ver);
+  |}.
+
+  Definition fsc_ret_write (nid : nat) (x : val_t) (t : tag_t) (st : FSC_State) := {|
+    fsc_curr_ver := S st.(fsc_curr_ver);
+    fsc_curr_excl_ver := st.(fsc_curr_excl_ver);
+    fsc_val_hist := NatMap_add (S st.(fsc_curr_ver)) (x, (t, nid)) st.(fsc_val_hist);
+    fsc_cmd := NatMap_add nid Idle st.(fsc_cmd);
+    fsc_succ_count := NatMap_add nid (S (fsc_get_succ_count nid st)) st.(fsc_succ_count);
+    fsc_local_ver := NatMap_add (S st.(fsc_curr_ver)) (fsc_get_succ_count nid st) st.(fsc_local_ver);
+  |}.
+
   Inductive fsc_call_step : FSC_State -> FSC_State -> Prop :=
   | fsc_call_step_ll : forall nid st,
       nid < Config.n ->
@@ -129,7 +148,11 @@ Module Type FSC (Config : LLSC_Config).
   | fsc_call_step_sc : forall nid x t st,
       nid < Config.n ->
       fsc_get_cmd nid st = LLDone ->
-      fsc_call_step st (fsc_start_sc nid x t st).
+      fsc_call_step st (fsc_start_sc nid x t st)
+  | fsc_call_step_write : forall nid x t st,
+      nid < Config.n ->
+      fsc_get_cmd nid st = Idle ->
+      fsc_call_step st (fsc_start_write nid x t st).
 
   Inductive fsc_sc_step : FSC_State -> FSC_State -> Prop :=
   | fsc_ret_step_sc_succ : forall nid x t st,
@@ -151,7 +174,11 @@ Module Type FSC (Config : LLSC_Config).
   | fsc_ret_step_sc : forall nid b st,
       nid < Config.n ->
       fsc_get_cmd nid st = SCDone b ->
-      fsc_ret_step st (fsc_cl nid st).
+      fsc_ret_step st (fsc_cl nid st)
+  | fsc_ret_step_write : forall nid x t st,
+      nid < Config.n ->
+      fsc_get_cmd nid st = WriteWait x t ->
+      fsc_ret_step st (fsc_ret_write nid x t st).
 
   Definition fsc_step st st' := fsc_call_step st st' \/ fsc_sc_step st st' \/ fsc_ret_step st st'.
 
@@ -168,13 +195,13 @@ Module Type FSC (Config : LLSC_Config).
     match type of Hstep with fsc_step ?st ?st' =>
     unfold fsc_step in Hstep;
     destruct Hstep as [Hstep | [Hstep | Hstep]];
-    [ destruct Hstep as [nid st Hpre1 Hpre2 | nid st Hpre1 Hpre2 | nid x t st Hpre1 Hpre2] |
+    [ destruct Hstep as [nid st Hpre1 Hpre2 | nid st Hpre1 Hpre2 | nid x t st Hpre1 Hpre2 | nid x t st Hpre1 Hpre2] |
       destruct Hstep as [nid x t st Hpre1 Hpre2 Hpre3 | nid x t st Hpre1 Hpre2] |
-      destruct Hstep as [nid v v' st Hpre1 Hpre2 Hpre3 | nid b st Hpre1 Hpre2]
+      destruct Hstep as [nid v v' st Hpre1 Hpre2 Hpre3 | nid b st Hpre1 Hpre2 | nid x t st Hpre1 Hpre2]
     ]
     end.
 
-  Ltac fsc_unfold := unfold fsc_start_ll, fsc_cl, fsc_start_sc, fsc_succ_sc, fsc_fail_sc, fsc_ret_ll, fsc_get_cmd, fsc_get_excl_ver, fsc_get_succ_count.
+  Ltac fsc_unfold := unfold fsc_start_ll, fsc_cl, fsc_start_sc, fsc_start_write, fsc_succ_sc, fsc_fail_sc, fsc_ret_ll, fsc_ret_write, fsc_get_cmd, fsc_get_excl_ver, fsc_get_succ_count.
   Ltac fsc_reduce := cbn [fsc_curr_ver fsc_curr_excl_ver fsc_val_hist fsc_cmd fsc_succ_count fsc_local_ver].
 
   Lemma fsc_ver_mono : forall st st', fsc_reachable st st' -> st.(fsc_curr_ver) <= st'.(fsc_curr_ver).
@@ -201,6 +228,9 @@ Module Type FSC (Config : LLSC_Config).
       + intros Hcmd.
         specialize (IH nid'' v'' Hcmd).
         lia.
+      + intros Hcmd.
+        specialize (IH nid'' v'' Hcmd).
+        lia.
   Qed.
 
   Lemma fsc_val_hist_not_none : forall st v,
@@ -222,6 +252,12 @@ Module Type FSC (Config : LLSC_Config).
         * rewrite NatMap_gso by lia.
           apply IH; auto.
         * subst v'; rewrite NatMap_gse by auto; discriminate.
+      + intros v' Hv'.
+        assert (Hv'2 : v' <= fsc_curr_ver st \/ v' = S (fsc_curr_ver st)) by lia.
+        destruct Hv'2 as [Hv'2 | Hv'2].
+        * rewrite NatMap_gso by lia.
+          apply IH; auto.
+        * subst v'; rewrite NatMap_gse by auto; discriminate.
   Qed.
 
   Lemma fsc_val_hist_valid : forall st v,
@@ -237,6 +273,11 @@ Module Type FSC (Config : LLSC_Config).
     - cbn in Hstep; step_case Hstep.
       all: fsc_unfold; fsc_reduce.
       all: try apply IH.
+      + intros v' Hv'.
+        destruct (Nat.eq_dec v' (S (fsc_curr_ver st))).
+        * subst v'; lia.
+        * rewrite NatMap_gso in Hv' by auto.
+          specialize (IH _ Hv'); lia.
       + intros v' Hv'.
         destruct (Nat.eq_dec v' (S (fsc_curr_ver st))).
         * subst v'; lia.
@@ -266,6 +307,13 @@ Module Type FSC (Config : LLSC_Config).
           cbn; auto.
         * rewrite NatMap_gso by auto.
           apply IH; auto.
+      + intros v' entry'.
+        destruct (Nat.eq_dec v' (S (fsc_curr_ver st))).
+        * subst v'; rewrite NatMap_gse by auto.
+          intros Heq; injection Heq; intros Heq2; subst entry'.
+          cbn; auto.
+        * rewrite NatMap_gso by auto.
+          apply IH; auto.
   Qed.
 
   Lemma fsc_val_local_ver_not_none : forall st v,
@@ -281,6 +329,11 @@ Module Type FSC (Config : LLSC_Config).
     - cbn in Hstep; step_case Hstep.
       all: fsc_unfold; fsc_reduce.
       all: try apply IH.
+      + intros v' Hv'.
+        assert (Hv'2 : v' <= fsc_curr_ver st \/ v' = S (fsc_curr_ver st)) by lia.
+        destruct Hv'2 as [Hv'2 | Hv'2].
+        * rewrite NatMap_gso by lia; apply IH; auto.
+        * subst v'; rewrite NatMap_gse; auto; discriminate.
       + intros v' Hv'.
         assert (Hv'2 : v' <= fsc_curr_ver st \/ v' = S (fsc_curr_ver st)) by lia.
         destruct Hv'2 as [Hv'2 | Hv'2].
@@ -305,6 +358,11 @@ Module Type FSC (Config : LLSC_Config).
         * subst v'; lia.
         * rewrite NatMap_gso in Hv' by auto.
           specialize (IH _ Hv'); lia.
+      + intros v' Hv'.
+        destruct (Nat.eq_dec v' (S (fsc_curr_ver st))).
+        * subst v'; lia.
+        * rewrite NatMap_gso in Hv' by auto.
+          specialize (IH _ Hv'); lia.
   Qed.
 
   Lemma fsc_ver_hist_mono : forall st st' v,
@@ -318,11 +376,16 @@ Module Type FSC (Config : LLSC_Config).
     - auto.
     - cbn in Hstep; step_case Hstep; specialize (IH Hval).
       all: try (fsc_unfold; fsc_reduce; apply IH).
-      intros Hnone; specialize (IH Hnone).
-      rewrite <- IH in Hnone.
-      pose proof (valid_reach_valid _ _ _ Hval Hreach) as Hval'.
-      pose proof (fsc_val_hist_valid _ _ Hval' Hnone).
-      fsc_unfold; fsc_reduce; rewrite NatMap_gso by lia; auto.
+      + intros Hnone; specialize (IH Hnone).
+        rewrite <- IH in Hnone.
+        pose proof (valid_reach_valid _ _ _ Hval Hreach) as Hval'.
+        pose proof (fsc_val_hist_valid _ _ Hval' Hnone).
+        fsc_unfold; fsc_reduce; rewrite NatMap_gso by lia; auto.
+      + intros Hnone; specialize (IH Hnone).
+        rewrite <- IH in Hnone.
+        pose proof (valid_reach_valid _ _ _ Hval Hreach) as Hval'.
+        pose proof (fsc_val_hist_valid _ _ Hval' Hnone).
+        fsc_unfold; fsc_reduce; rewrite NatMap_gso by lia; auto.
   Qed.
 
   Lemma fsc_val_hist_zero : forall st,
@@ -346,11 +409,16 @@ Module Type FSC (Config : LLSC_Config).
     - auto.
     - cbn in Hstep; step_case Hstep; specialize (IH Hval).
       all: try (fsc_unfold; fsc_reduce; apply IH).
-      intros Hnone; specialize (IH Hnone).
-      rewrite <- IH in Hnone.
-      pose proof (valid_reach_valid _ _ _ Hval Hreach) as Hval'.
-      pose proof (fsc_local_ver_valid _ _ Hval' Hnone).
-      fsc_unfold; fsc_reduce; rewrite NatMap_gso by lia; auto.
+      + intros Hnone; specialize (IH Hnone).
+        rewrite <- IH in Hnone.
+        pose proof (valid_reach_valid _ _ _ Hval Hreach) as Hval'.
+        pose proof (fsc_local_ver_valid _ _ Hval' Hnone).
+        fsc_unfold; fsc_reduce; rewrite NatMap_gso by lia; auto.
+      + intros Hnone; specialize (IH Hnone).
+        rewrite <- IH in Hnone.
+        pose proof (valid_reach_valid _ _ _ Hval Hreach) as Hval'.
+        pose proof (fsc_local_ver_valid _ _ Hval' Hnone).
+        fsc_unfold; fsc_reduce; rewrite NatMap_gso by lia; auto.
   Qed.
 
   Lemma fsc_local_ver_zero : forall st,
@@ -396,7 +464,24 @@ Module Type FSC (Config : LLSC_Config).
           -- subst nid'; rewrite NatMap_gse by auto.
              unfold fsc_get_succ_count in IH; rewrite e in IH; lia.
           -- rewrite NatMap_gso by auto.
-             unfold fsc_get_succ_count in IH; auto.        
+             unfold fsc_get_succ_count in IH; auto.
+      + intros v' entry' nid' lv'.
+        destruct (Nat.eq_dec v' (S (fsc_curr_ver st))).
+        * subst v'; repeat rewrite NatMap_gse by auto.
+          intros Hentry' Hnid'.
+          injection Hentry'; intros Hentry'2; subst entry'; clear Hentry'.
+          cbn in Hnid'; subst nid'.
+          rewrite NatMap_gse by auto.
+          intros Heq; injection Heq; intros Heq2; subst lv'.
+          lia.
+        * repeat rewrite NatMap_gso by auto.
+          intros Hentry' Hnid' Hlv'.
+          specialize (IH _ _ _ _ Hentry' Hnid' Hlv').
+          destruct (Nat.eq_dec nid' nid).
+          -- subst nid'; rewrite NatMap_gse by auto.
+             unfold fsc_get_succ_count in IH; rewrite e in IH; lia.
+          -- rewrite NatMap_gso by auto.
+             unfold fsc_get_succ_count in IH; auto.
   Qed.
 
   Lemma fsc_succ_count_exist : forall st nid,
@@ -416,6 +501,25 @@ Module Type FSC (Config : LLSC_Config).
     - cbn in Hstep; step_case Hstep.
       all: fsc_unfold; fsc_reduce.
       all: try apply IH.
+      + intros nid'.
+        destruct (Nat.eq_dec nid' nid).
+        * subst nid'; repeat rewrite NatMap_gse by auto.
+          right.
+          repeat eexists.
+          1: rewrite NatMap_gse.
+          1,2: reflexivity.
+          1: cbn; auto.
+          rewrite NatMap_gse by auto.
+          f_equal; lia.
+        * repeat rewrite NatMap_gso by auto.
+          specialize (IH nid').
+          destruct IH as [IH | (v & entry & IH)].
+          1: left; apply IH.
+          right; exists v; exists entry.
+          destruct IH as (IH1 & IH2 & IH3).
+          pose proof (fsc_val_hist_valid _ _ Hval ltac:(rewrite IH1; discriminate)) as Hv.
+          repeat split; auto.
+          all: rewrite NatMap_gso by lia; auto.
       + intros nid'.
         destruct (Nat.eq_dec nid' nid).
         * subst nid'; repeat rewrite NatMap_gse by auto.
@@ -473,6 +577,22 @@ Module Type FSC (Config : LLSC_Config).
           rewrite NatMap_gso in Hv'2 by lia.
           do 2 rewrite NatMap_gso by lia.
           apply IH; auto.
+      + intros nid' v' v'' entry' entry'' lv' lv'' Hv'1 Hv'2 Hv''.
+        destruct (Nat.eq_dec v'' (S (fsc_curr_ver st))).
+        * subst v''; rewrite NatMap_gse in Hv'' by auto.
+          injection Hv''; intros Heq; subst entry''; clear Hv''.
+          rewrite NatMap_gso in Hv'2 by lia.
+          intros Hnid'1 Hnid'2; cbn in Hnid'2; subst nid'.
+          rewrite NatMap_gso by lia.
+          rewrite NatMap_gse by auto.
+          intros Hlv' Hlv''.
+          injection Hlv''; intros Heq; subst lv''; clear Hlv''.
+          apply (fsc_local_ver_lt_succ_count _ v' _ _ _ Hval Hv'2 Hnid'2 Hlv').
+        * rewrite NatMap_gso in Hv'' by lia.
+          pose proof (fsc_val_hist_valid _ _ Hval ltac:(rewrite Hv''; discriminate)) as Hle.
+          rewrite NatMap_gso in Hv'2 by lia.
+          do 2 rewrite NatMap_gso by lia.
+          apply IH; auto.
   Qed.
 
   Lemma fsc_succ_count_lt_exist : forall st nid lv,
@@ -493,6 +613,27 @@ Module Type FSC (Config : LLSC_Config).
     - cbn in Hstep; step_case Hstep.
       all: fsc_unfold; fsc_reduce.
       all: try apply IH.
+      + intros nid' lv' Hlv'.
+        destruct (Nat.eq_dec nid' nid).
+        * subst nid'; rewrite NatMap_gse in Hlv' by auto.
+          match type of Hlv' with lv' < S ?x => assert (Hlv'2 : lv' < x \/ lv' = x) by lia end.
+          destruct Hlv'2 as [Hlv'2 | Hlv'2].
+          -- specialize (IH _ _ Hlv'2) as (v' & entry' & IH1 & IH2 & IH3).
+             exists v'; exists entry'.
+             pose proof (fsc_val_hist_valid _ _ Hval ltac:(rewrite IH1; discriminate)) as Hle.
+             do 2 rewrite NatMap_gso by lia.
+             repeat split; auto.
+          -- subst lv'; do 2 eexists; repeat split.
+             1: rewrite NatMap_gse.
+             1,2: reflexivity.
+             1: cbn; auto.
+             rewrite NatMap_gse; auto.
+        * rewrite NatMap_gso in Hlv' by auto.
+          specialize (IH _ _ Hlv') as (v' & entry' & IH1 & IH2 & IH3).
+          exists v'; exists entry'.
+          pose proof (fsc_val_hist_valid _ _ Hval ltac:(rewrite IH1; discriminate)) as Hle.
+          do 2 rewrite NatMap_gso by lia.
+          repeat split; auto.
       + intros nid' lv' Hlv'.
         destruct (Nat.eq_dec nid' nid).
         * subst nid'; rewrite NatMap_gse in Hlv' by auto.
